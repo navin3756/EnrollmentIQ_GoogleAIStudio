@@ -1,0 +1,6 @@
+{
+  "name": "Remix: EDI 834 Enrollment Parser",
+  "description": "A comprehensive dashboard for managing, parsing, and reviewing EDI 834 Benefit Enrollment files. Features workflow visualization, staging data review, and production analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
