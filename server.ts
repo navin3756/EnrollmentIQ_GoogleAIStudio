@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import chokidar from 'chokidar';
+import Database from 'better-sqlite3';
 
 // Set up Multer for handling file uploads (stored in memory)
 const upload = multer({ storage: multer.memoryStorage() });
@@ -11,10 +12,41 @@ const upload = multer({ storage: multer.memoryStorage() });
 // Function to generate a random ID
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
-// Simulated database for storing parsed files
-const filesDB: any[] = [];
-const stagingDataDB: Record<string, any[]> = {};
-const auditLogs: Record<string, any[]> = {};
+// Initialize SQLite Database
+const dbPath = path.join(process.cwd(), 'database.sqlite');
+const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS files (
+    fileId TEXT PRIMARY KEY,
+    data JSON NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS staging_data (
+    fileId TEXT PRIMARY KEY,
+    records JSON NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    action TEXT,
+    metadata JSON NOT NULL
+  );
+`);
+
+const stmtInsertFile = db.prepare('INSERT OR REPLACE INTO files (fileId, data) VALUES (?, ?)');
+const stmtGetFiles = db.prepare('SELECT data FROM files ORDER BY rowid DESC');
+const stmtInsertStaging = db.prepare('INSERT OR REPLACE INTO staging_data (fileId, records) VALUES (?, ?)');
+const stmtGetStaging = db.prepare('SELECT records FROM staging_data WHERE fileId = ?');
+const stmtInsertAudit = db.prepare('INSERT INTO audit_logs (timestamp, action, metadata) VALUES (?, ?, ?)');
+
+// Initialize from DB
+let filesDB: any[] = stmtGetFiles.all().map((row: any) => JSON.parse(row.data));
+let stagingDataDB: Record<string, any[]> = {};
+db.prepare('SELECT fileId, records FROM staging_data').all().forEach((row: any) => {
+    stagingDataDB[row.fileId] = JSON.parse(row.records);
+});
+
 
 // --- HIPAA & AUDIT INTERFACES (DEF-001, DEF-002) ---
 interface IRemediationRule {
@@ -142,6 +174,8 @@ const secureAuditLogger = (action: string, metadata: any) => {
     if (sanitizedMetadata.ssn) sanitizedMetadata.ssn = '***MASKED***';
     if (sanitizedMetadata.memberId) sanitizedMetadata.memberId = sanitizedMetadata.memberId.slice(0, 4) + '...';
     
+    // Save to SQLite Audit Log DB
+    stmtInsertAudit.run(new Date().toISOString(), action, JSON.stringify(sanitizedMetadata));
     console.log(`[HIPAA_AUDIT] ${new Date().toISOString()} | ACTION: ${action} | DATA: ${JSON.stringify(sanitizedMetadata)}`);
 };
 
@@ -253,6 +287,10 @@ function processFileContent(fileContent: string, fileName: string, fileSize: num
 
   filesDB.unshift(newFile);
   stagingDataDB[fileId] = parsedRecords;
+
+  // Persist to DB
+  stmtInsertFile.run(fileId, JSON.stringify(newFile));
+  stmtInsertStaging.run(fileId, JSON.stringify(parsedRecords));
 
   secureAuditLogger('FILE_PROCESS_COMPLETE', { fileId, fileName, recordCount: parsedRecords.length });
   
@@ -387,7 +425,10 @@ async function startServer() {
           if (file.errorRecords === 0) {
               file.status = 'READY_TO_PROCESS';
           }
+          stmtInsertFile.run(fileId, JSON.stringify(file));
         }
+        stmtInsertStaging.run(fileId, JSON.stringify(records));
+
         return res.json(records[idx]);
       }
     }
@@ -407,6 +448,7 @@ async function startServer() {
        file.ackStatus = 'Sent';
        file.ackPayload = ack997; // Store for audit/download
 
+       stmtInsertFile.run(fileId, JSON.stringify(file));
        secureAuditLogger('FILE_PROCESSED', { fileId, status: 'SUCCESS' });
     }
     res.json({ success: true });
